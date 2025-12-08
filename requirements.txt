@@ -1,0 +1,16 @@
+#base
+numpy
+pandas
+matplotlib
+pyyaml
+
+ipykernel
+jupyter
+
+
+# Brokers / Data (optional, enable according to your usage)
+ibapi
+ib-insync
+futu-api
+python-binance
+yfinance
