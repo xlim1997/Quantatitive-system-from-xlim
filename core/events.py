@@ -88,26 +88,44 @@ class MarketEvent(Event):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Bar:
-    """
-    标准 K 线（OHLCV）结构。
+# class Bar:
+#     """
+#     标准 K 线（OHLCV）结构。
 
-    字段：
-    - open   : 开盘价
-    - high   : 最高价
-    - low    : 最低价
-    - close  : 收盘价
-    - volume : 成交量（没有可以用 0.0）
+#     字段：
+#     - open   : 开盘价
+#     - high   : 最高价
+#     - low    : 最低价
+#     - close  : 收盘价
+#     - volume : 成交量（没有可以用 0.0）
 
-    说明：
-    - 这是一个“领域模型（domain model）”，不包含时间戳和 symbol；
-      时间戳和 symbol 信息由 MarketDataEvent 来承载。
-    """
+#     说明：
+#     - 这是一个“领域模型（domain model）”，不包含时间戳和 symbol；
+#       时间戳和 symbol 信息由 MarketDataEvent 来承载。
+#     """
+#     open: float
+#     high: float
+#     low: float
+#     close: float
+#     volume: float = 0.0
+
+class Bar:#futu k线数据结构
+    # OHLCV
     open: float
     high: float
     low: float
     close: float
     volume: float = 0.0
+
+    # extra kline fields (optional)
+    code: Optional[str] = None          # 股票代码（通常等于 MarketDataEvent.symbol）
+    name: Optional[str] = None          # 股票名称
+    time_key: Optional[str] = None      # 原始K线时间字符串
+    pe_ratio: Optional[float] = None    # 市盈率
+    turnover_rate: Optional[float] = None  # 换手率
+    turnover: Optional[float] = None    # 成交额
+    change_rate: Optional[float] = None # 涨跌幅
+    last_close: Optional[float] = None  # 昨收价
 
 
 # 如果你以后需要 Tick / OrderBook，可以在这里扩展，例如：

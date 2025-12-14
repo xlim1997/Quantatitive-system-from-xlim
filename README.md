@@ -223,3 +223,94 @@ pip install -r requirements
       "MSFT": "data/msft_daily.csv",
   }
 
+### 5. Brokerage（券商/撮合）层说明
+
+Brokerage 层负责把订单真正“执行”出来：
+
+- 回测时：用 `PaperBrokerage` 做撮合（模拟成交）
+- 实盘时：用 `IBKRBrokerage` / `FutuBrokerage` 连接真实券商 API
+
+#### 5.1 统一接口：`brokerage/base.py`
+
+所有 Brokerage 必须实现：
+
+- `place_order(order: OrderEvent)`  
+  接收订单请求  
+- `get_fills() -> List[FillEvent]`  
+  返回新产生的成交回报（FillEvent）
+
+引擎会在每个时间步调用 `get_fills()`，并把成交传给 `Portfolio.update_from_fill()` 更新账户状态。
+
+#### 5.2 回测撮合：`brokerage/paper.py`
+
+`PaperBrokerage` 是最小可用的回测撮合器：
+
+- 当前只支持 `MARKET` 市价单
+- 立即按当前 `close` 成交
+- 支持：
+  - `slippage`（滑点，买更贵卖更便宜）
+  - `commission_rate`（按成交额收取比例手续费）
+  - `fixed_commission`（每笔固定手续费）
+
+后续可以扩展更真实的撮合机制（限价单、部分成交、bid/ask spread 等）。
+
+
+### 6. 三模型解耦（Portfolio / Risk / Execution）
+
+本框架采用 Lean 风格的三模型解耦：
+
+1) **PortfolioConstructionModel**
+- 输入：策略产生的 `Insights`
+- 输出：组合目标 `PortfolioTargets`（目标权重）
+
+代码位置：`portfolio/construction.py`  
+- `EqualWeightLongOnlyPC`：只做多、等权分配  
+- `WeightedByHintPC`：按 `weight_hint` 加权（支持多空），并可做总曝险归一化
+
+2) **RiskManagementModel**
+- 输入：初始 `PortfolioTargets`
+- 输出：风险调整后的 Targets
+
+代码位置：`portfolio/risk.py`  
+- `NoRiskModel`：不做风险调整  
+- `MaxGrossExposureRiskModel`：限制总绝对权重（gross exposure）  
+- `MaxPositionWeightRiskModel`：限制单票最大权重
+
+3) **ExecutionModel**
+- 输入：风险调整后的 Targets + 当前组合状态 + 最新价格
+- 输出：订单 `OrderEvent` 并发送给 Brokerage
+
+代码位置：`portfolio/execution.py`  
+- `ImmediateExecutionModel`：一次性调仓到目标权重（市价单）
+
+这种设计的好处：
+- 策略只负责产生观点（Insights），不必关心交易细节  
+- 风控与执行逻辑可独立替换，方便做消融实验和策略对比  
+- 回测到实盘迁移时，只需替换数据源和券商适配层，核心逻辑复用
+
+
+### 7. Engine（主循环调度器）
+
+`core/engine.py` 定义了主引擎 `Engine`，它负责把所有模块串起来：
+
+每个时间步（一个 bar）：
+1. DataFeed 产生 `MarketDataEvent` 切片  
+2. Algorithm 生成 `Insights`  
+3. PortfolioConstructionModel：Insights → Targets  
+4. RiskManagementModel：Targets → Adjusted Targets  
+5. ExecutionModel：Adjusted Targets → Orders（OrderEvent）  
+6. Brokerage 返回 `FillEvent`  
+7. Portfolio 根据 `FillEvent` 更新现金与持仓  
+8. Engine 记录净值、仓位快照用于回测分析
+
+#### Active Insights（轻量版 InsightManager）
+
+为了避免策略每个 bar 重复输出相同信号，引擎提供 active insight 缓存：
+
+- 策略可以只在信号发生变化时输出 Insight  
+- Engine 会缓存 active insights，直到：
+  - 被 `FLAT` 覆盖（撤销观点）
+  - 或到期（expiry，可选）
+
+这样更接近 Lean 的 Insight 管理机制。
+
