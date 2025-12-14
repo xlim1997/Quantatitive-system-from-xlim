@@ -118,3 +118,108 @@ pip install -r requirements
                                               [ Portfolio ]
 
 
+### 3. Portfolio & Insights 模型说明
+
+在这个框架中，**策略不直接控制“买多少股”**，而是遵循 QuantConnect Lean 式的三层结构：
+
+1. 策略（Algorithm）输出 **Insights**  
+2. 组合构建模型（PortfolioConstructionModel）把 Insights 转成 **目标权重（PortfolioTargets）**  
+3. 风险模型（RiskModel）和执行模型（ExecutionModel）在此基础上做风险控制和下单细化  
+
+对应的代码位置：
+
+- `portfolio/models.py`
+  - `InsightDirection`  
+    - `UP` / `DOWN` / `FLAT`，对应看多 / 看空 / 中性  
+  - `Insight`  
+    - 策略对某个标的的“观点”：  
+      - `symbol`：标的，例如 `"AAPL"`  
+      - `direction`：`UP/DOWN/FLAT`  
+      - `weight_hint`：希望的相对权重（例如 `+0.1` 表示想要 10% 多头）  
+  - `PortfolioTarget`  
+    - 组合构建后得到的目标持仓权重：  
+      - `symbol`  
+      - `target_percent`：目标权重（例如 `0.20` 表示 20% 多头）
+
+- `portfolio/state.py`
+  - `Position`  
+    - 单个标的的持仓信息（数量 + 均价）  
+  - `Portfolio`  
+    - 整个组合状态（现金 + 所有持仓）  
+    - 核心方法：  
+      - `update_from_fill(fill)`：根据成交事件（`FillEvent`）更新现金和持仓  
+      - `total_value(last_prices)`：根据最新价格计算当前组合净值  
+      - `snapshot(last_prices)`：返回一个适合写日志/调试的组合快照
+
+通过这种设计：
+
+- **Algorithm** 只负责“生成观点（Insights）”  
+- **PortfolioConstruction + Risk + Execution** 负责把观点变成可执行订单  
+- **Portfolio** 负责“记账和估值”，不参与决策
+
+这使得你可以在不改策略代码的情况下：
+
+- 换一套组合构建逻辑（等权、多因子打分、风险平价等）  
+- 换一套风险模型（更激进或更保守）  
+- 换一套执行模型（一次性市价成交 vs 分批 TWAP）  
+
+非常适合做系统化回测、策略对比实验和风控研究。
+
+
+### 4. 策略 & 数据层说明（Algorithm & DataFeed）
+
+#### 4.1 策略基类：`algorithm/base.py`
+
+策略不直接“下单”，而是继承 `BaseAlgorithm`，通过 `on_data()` 返回一组 **Insights**：
+
+- `BaseAlgorithm.initialize()`  
+  在引擎开始运行前调用，用来：
+  - 选择标的（`self.add_equity("AAPL")`）
+  - 设置参数（窗口长度、因子权重等）
+  - 初始化内部状态（价格缓存、指标等）
+
+- `BaseAlgorithm.on_data(data)`  
+  每个时间步由引擎调用，其中：
+  - `data` 是一个字典：`{symbol: MarketDataEvent, ...}`  
+  - 策略根据这些行情数据，返回一个 `List[Insight]`，例如：
+
+    ```python
+    [
+      Insight(symbol="AAPL", direction=UP,   weight_hint=0.2),
+      Insight(symbol="MSFT", direction=FLAT, weight_hint=0.0),
+    ]
+    ```
+
+这些 Insights 会被后续的：
+
+- `PortfolioConstructionModel` 转成目标权重（PortfolioTargets）
+- `RiskManagementModel` 做风险过滤
+- `ExecutionModel` 转成真实订单（OrderEvent）
+
+#### 4.2 数据源接口：`data/base.py`
+
+数据源（DataFeed）的职责是“按时间顺序提供行情切片”：
+
+- 所有数据源都继承 `BaseDataFeed`，必须实现：
+  - `__iter__(self) -> Iterator[Dict[str, MarketDataEvent]]`
+    - 每次迭代返回某个时间点的多标的行情：
+      `{symbol: MarketDataEvent, ...}`
+  - `last_market_data` 属性：
+    - 返回最近一次产生的行情切片，供撮合和组合估值使用。
+
+通过这个接口，可以很方便地切换不同的数据源实现：
+
+- 回测：`LocalCSVDataFeed`（从本地 CSV 读历史数据）
+- 实盘：`LiveAPIDataFeed`（从 Futu / IBKR / Binance 等拉实时数据）
+
+#### 4.3 本地 CSV 数据源：`data/local_csv.py`
+
+`LocalCSVDataFeed` 是一个用于回测的简单数据源实现：
+
+- 初始化时传入 `symbol_to_path` 字典：
+  ```python
+  symbol_to_path = {
+      "AAPL": "data/aapl_daily.csv",
+      "MSFT": "data/msft_daily.csv",
+  }
+
