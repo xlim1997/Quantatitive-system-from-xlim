@@ -314,3 +314,21 @@ Brokerage 层负责把订单真正“执行”出来：
 
 这样更接近 Lean 的 Insight 管理机制。
 
+
+## Strategies（策略库）
+
+### Momentum（横截面动量选股）
+路径：`strategies/momentum/main.py`
+
+- 维护每个标的 close 历史
+- 动量 = close[t] / close[t-lookback] - 1
+- 每 `rebalance_every` 根 bar：
+  - 选 Top-K 做多
+  - 可选 Bottom-K 做空
+  - 对被踢出的旧标的显式输出 `FLAT`，确保 Engine 的 `active_insights` 不会遗留旧仓位
+
+运行：
+```bash
+python run_momentum_backtest.py
+
+
