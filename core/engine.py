@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
 from algorithm.base import BaseAlgorithm
-from core.events import MarketDataEvent, FillEvent
+from core.events import MarketDataEvent, FillEvent, OrderEvent
 from data.base import BaseDataFeed
 from brokerage.base import BaseBrokerage
 from portfolio.state import Portfolio
@@ -79,6 +79,8 @@ class Engine:
         self.current_time: Any = None
         self._active_insights: Dict[str, Insight] = {}  # symbol -> Insight
         self.records: List[EngineRecord] = []
+        self.order_log: List[OrderEvent] = []
+        self.fill_log: List[FillEvent] = []
 
         # 反向注入：让策略/券商/执行知道 engine
         self.algorithm.set_engine(self)
@@ -94,6 +96,7 @@ class Engine:
         Engine 再把订单交给 Brokerage（回测撮合 or 实盘券商）处理。
         """
         self.brokerage.place_order(order_event)
+        self.order_log.append(order_event)
 
     # ---------------------------------------------------------------------
     # 处理成交：更新 Portfolio
@@ -103,7 +106,7 @@ class Engine:
         Brokerage 返回 FillEvent，Engine 负责把它交给 Portfolio 更新状态。
         """
         self.portfolio.update_from_fill(fill)
-
+        self.fill_log.append(fill)
     # ---------------------------------------------------------------------
     # Insight 缓存（轻量 InsightManager）
     # ---------------------------------------------------------------------
@@ -159,7 +162,9 @@ class Engine:
         self.algorithm.initialize()
 
         # 2) 遍历历史行情（或实盘事件流）
+        
         for market_slice in self.data_feed:
+            # import ipdb; ipdb.set_trace()
             if not market_slice:
                 continue
 
@@ -168,7 +173,8 @@ class Engine:
 
             # 最新价格：用于估值 & 执行模型换算目标股数
             last_prices = {sym: ev.bar.close for sym, ev in market_slice.items()}
-
+            self.portfolio.update_prices({k: float(v) for k, v in last_prices.items()})   
+            
             # 2.1 策略生成 Insights
             new_insights = self.algorithm.on_data(market_slice) or []
 
@@ -188,7 +194,8 @@ class Engine:
             fills = self.brokerage.get_fills()
             for fill in fills:
                 self.handle_fill(fill)
-
+                
+                # 记录订单（可选）
             # 2.7 记录结果（现金、净值、仓位）
             snapshot = self.portfolio.snapshot(last_prices)
             self.records.append(
