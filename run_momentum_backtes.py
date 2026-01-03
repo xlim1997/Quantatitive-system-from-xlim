@@ -1,7 +1,7 @@
 # run_momentum_backtest.py
 from __future__ import annotations
 
-from backtesting.engine import BacktestEngine
+from backtesting.engine import BacktestEngine,Engine
 from backtesting.performance import compute_performance
 
 from portfolio.construction import WeightedByHintPC
@@ -51,7 +51,7 @@ def main():
     # 4) 数据（先用 CSV 示例；你换成 data_feed=FutuHistoryKlineDataFeed / IBKRHistoryBarDataFeed 即可）
     symbol_to_path = {sym: f"data/{sym.lower()}_daily.csv" for sym in universe}
 
-    bt = BacktestEngine(
+    bt = Engine(
         algorithm=algo,
         symbol_to_path=symbol_to_path,  # 若你改成可注入 data_feed，这里就传 data_feed=...
         pc_model=pc_model,
@@ -64,12 +64,11 @@ def main():
         keep_insights_active=True,
     )
 
-    df = bt.run_to_dataframe()
+    df = bt.run()
 
     # ✅ 交易统计（需要 engine logs + portfolio trade log）
-    turn = compute_turnover(bt.engine.fill_log, df["equity"])
-    trade_summary = summarize_trades(bt.engine.portfolio.trade_log)
-
+    turn = compute_turnover(bt.fill_log, df["equity"])
+    trade_summary = summarize_trades(bt.portfolio.trade_log)
     print("\n=== Turnover ===")
     for k, v in turn.items():
         print(f"{k:>20}: {v}")
