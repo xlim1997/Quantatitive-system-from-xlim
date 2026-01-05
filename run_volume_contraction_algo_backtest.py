@@ -24,11 +24,35 @@ from brokerage.paper import PaperBrokerage
 from universe.symbol_list import symbols_nasdaq_100, symbols_sp500
 def main():
     # 1) Universe（先用 5-20 个股票跑通，后面再扩）
-    universe = symbols_nasdaq_100 # nasdaq100, SP500, dow30, custom
-
+    universe = symbols_nasdaq_100[:10] # nasdaq100, SP500, dow30, custom
+    print("Universe:", universe)
+    # 2) DataFeed for selected universe
+    contracts = {sym: IBKRContractSpec(symbol=sym) for sym in universe}
+    data_feed = IBKRHistoryBarDataFeed(
+        contracts=contracts,
+        duration_str="6 M",
+        bar_size="1 day",
+        what_to_show="ADJUSTED_LAST",
+        use_rth=True,
+        end_datetime="",  # "" means now
+        conn=IBKRConnConfig_Historical(
+            host="127.0.0.1",
+            port=7497,      # TWS paper常见 7497；live常见 7496（看你设置）
+            client_id=1,
+        ),
+    )
     
-
-    
+     # 2) selector（无前视） #还需要debug
+    sel_cfg = VolumeContractionConfig(
+        vol_spike_mult=2.0,
+        vol_shrink_mult=0.7,
+        ma_fast=10,
+        ma_slow=20,
+        setup_lookback=20,
+        # strict_no_lookahead=True,
+    )
+    selector = VolumeContractionSelector(sel_cfg)
+    import ipdb; ipdb.set_trace()
     
     
     # 2) Strategy
@@ -55,32 +79,8 @@ def main():
     exec_model = ImmediateExecutionModel(min_trade_value=65.0)
     
     #
-    # 4) DataFeed
-    # IBKR DATA FEED
-    contracts = {symbol: IBKRContractSpec(symbol=symbol) for symbol in universe}
-    # 4) DataFeed (IBKR)
-    # durationStr: Time span of all the bars. Examples:
-    #             '60 S', '30 D', '13 W', '6 M', '10 Y'.
-    # barSizeSetting: Time period of one bar. Must be one of:
-    #             '1 secs', '5 secs', '10 secs' 15 secs', '30 secs',
-    #             '1 min', '2 mins', '3 mins', '5 mins', '10 mins', '15 mins',
-    #             '20 mins', '30 mins',
-    #             '1 hour', '2 hours', '3 hours', '4 hours', '8 hours',
-    #             '1 day', '1 week', '1 month'.
-    contracts = {sym: IBKRContractSpec(symbol=sym) for sym in universe}
-    data_feed = IBKRHistoryBarDataFeed(
-        contracts=contracts,
-        duration_str="6 M",
-        bar_size="1 day",
-        what_to_show="ADJUSTED_LAST",
-        use_rth=True,
-        end_datetime="",  # "" means now
-        conn=IBKRConnConfig(
-            host="127.0.0.1",
-            port=7497,      # TWS paper常见 7497；live常见 7496（看你设置）
-            client_id=1,
-        ),
-    )
+    # 
+    
     # 5) Backtest 引擎
     
     bt = Backtest(

@@ -86,6 +86,7 @@ class IBKRHistoryBarDataFeed(BaseDataFeed):
                     formatDate=1,
                     keepUpToDate=False,
                 )
+                # import ipdb; ipdb.set_trace()
                 self._bars_by_symbol[sym] = list(bars)
         finally:
             ib.disconnect()

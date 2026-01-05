@@ -8,7 +8,7 @@ from portfolio.construction import WeightedByHintPC
 from portfolio.execution import ImmediateExecutionModel
 
 from strategies.CrossSectionalMomentumStrategy import CrossSectionalMomentumStrategy, MomentumConfig
-from data.ibkr_feed import IBKRHistoryBarDataFeed, IBKRContractSpec, IBKRConnConfig
+from data.ibkr_feed import IBKRHistoryBarDataFeed, IBKRContractSpec, IBKRConnConfig_Historical
 from data.futu_feed import FutuHistoryKlineDataFeed, FutuConnConfig
 from backtesting.trade_stats import compute_turnover, summarize_trades
 from portfolio.risk import (
@@ -73,7 +73,7 @@ def main():
         what_to_show="ADJUSTED_LAST",
         use_rth=True,
         end_datetime="",  # "" means now
-        conn=IBKRConnConfig(
+        conn=IBKRConnConfig_Historical(
             host="127.0.0.1",
             port=7497,      # TWS paper常见 7497；live常见 7496（看你设置）
             client_id=1,

@@ -47,6 +47,8 @@ class EngineRecord:
     cash: float
     equity: float
     positions: dict
+    realized_pnl: float = 0.0
+
 
 
 class Engine:
@@ -108,17 +110,17 @@ class Engine:
         self.order_log.append(order_event)
         # ✅ 记录订单状态：SUBMITTED
         ts = getattr(order_event, "timestamp", None) or self.current_time
-        self.journal.log_order(
-            ts=ts,
-            order_id=str(getattr(order_event, "order_id", id(order_event))),
-            symbol=str(getattr(order_event, "symbol", "")),
-            side=str(getattr(order_event, "side", "")),
-            qty=float(getattr(order_event, "quantity", getattr(order_event, "qty", 0.0))),
-            order_type=str(getattr(order_event, "order_type", "MKT")),
-            status=str(getattr(order_event, "status", "SUBMITTED")),
-            limit_price=getattr(order_event, "limit_price", None),
-            payload=order_event,
-        )
+        # self.journal.log_order(
+        #     ts=ts,
+        #     order_id=str(getattr(order_event, "order_id", id(order_event))),
+        #     symbol=str(getattr(order_event, "symbol", "")),
+        #     side=str(getattr(order_event, "side", "")),
+        #     qty=float(getattr(order_event, "quantity", getattr(order_event, "qty", 0.0))),
+        #     order_type=str(getattr(order_event, "order_type", "MKT")),
+        #     status=str(getattr(order_event, "status", "SUBMITTED")),
+        #     limit_price=getattr(order_event, "limit_price", None),
+        #     payload=order_event,
+        # )
     # ---------------------------------------------------------------------
     # 处理成交：更新 Portfolio
     # ---------------------------------------------------------------------
@@ -129,17 +131,17 @@ class Engine:
         self.portfolio.update_from_fill(fill)
         self.fill_log.append(fill)
         ts = getattr(fill, "timestamp", None) or self.current_time
-        self.journal.log_fill(
-            ts=ts,
-            fill_id=str(getattr(fill, "fill_id", id(fill))),
-            order_id=str(getattr(fill, "order_id", "")),
-            symbol=str(getattr(fill, "symbol", "")),
-            side=str(getattr(fill, "side", "")),
-            qty=float(getattr(fill, "quantity", getattr(fill, "qty", 0.0))),
-            price=float(getattr(fill, "price", 0.0)),
-            commission=float(getattr(fill, "commission", 0.0)),
-            payload=fill,
-        )
+        # self.journal.log_fill(
+        #     ts=ts,
+        #     fill_id=str(getattr(fill, "fill_id", id(fill))),
+        #     order_id=str(getattr(fill, "order_id", "")),
+        #     symbol=str(getattr(fill, "symbol", "")),
+        #     side=str(getattr(fill, "side", "")),
+        #     qty=float(getattr(fill, "quantity", getattr(fill, "qty", 0.0))),
+        #     price=float(getattr(fill, "price", 0.0)),
+        #     commission=float(getattr(fill, "commission", 0.0)),
+        #     payload=fill,
+        # )
     # ---------------------------------------------------------------------
     # Insight 缓存（轻量 InsightManager）
     # ---------------------------------------------------------------------
