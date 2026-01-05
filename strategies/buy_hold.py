@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from algorithm.base import BaseAlgorithm
+from strategies.base import BaseAlgorithm
 from core.events import MarketDataEvent
 from portfolio.models import Insight, InsightDirection
 

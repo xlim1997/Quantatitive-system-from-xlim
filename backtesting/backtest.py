@@ -12,7 +12,7 @@ from data.local_csv import LocalCSVDataFeed
 from brokerage.base import BaseBrokerage
 from brokerage.paper import PaperBrokerage
 from portfolio.state import Portfolio
-from algorithm.base import BaseAlgorithm
+from strategies.base import BaseAlgorithm
 from portfolio.construction import BasePortfolioConstructionModel
 from portfolio.risk import BaseRiskManagementModel
 from portfolio.execution import BaseExecutionModel

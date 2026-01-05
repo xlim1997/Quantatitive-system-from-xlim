@@ -9,10 +9,11 @@ from ib_insync import IB, Stock, Contract, util  # type: ignore
 
 from core.events import MarketDataEvent, EventType, Bar
 from data.base import BaseDataFeed
+from data.aggregators import BarAggregator, AggConfig
 
 
 @dataclass
-class IBKRConnConfig:
+class IBKRConnConfig_Historical:
     host: str = "127.0.0.1"
     port: int = 4002          # TWS paper 默认 7497；live 默认 7496 IB Gateway paper 默认 4002；live 默认 4001
     client_id: int = 1
@@ -51,7 +52,7 @@ class IBKRHistoryBarDataFeed(BaseDataFeed):
         what_to_show: str = "TRADES",               # TRADES/MIDPOINT/BID/ASK
         use_rth: bool = True,                       # 只用 RTH（常规交易时段）
         end_datetime: str = "",                     # 空字符串表示“到现在”
-        conn: IBKRConnConfig = IBKRConnConfig(),
+        conn: IBKRConnConfig_Historical = IBKRConnConfig_Historical(),
     ) -> None:
         self.contracts = contracts
         self.duration_str = duration_str
@@ -129,58 +130,55 @@ class IBKRHistoryBarDataFeed(BaseDataFeed):
                 yield events
 
 
-class IBKRLiveBarDataFeed(BaseDataFeed):
-    """
-    准实时用：使用 “历史bar + keepUpToDate” 的方式持续收到最新bar更新。
+@dataclass
+class IBKRConnConfig_Live:
+    host: str = "127.0.0.1"
+    port: int = 4001
+    client_id: int = 11
 
-    注意：
-    - keepUpToDate 需要 endDateTime="" 且 barSize >= 5 seconds；
-      更新会通过 historicalDataUpdate 回来。
-    - 所以如果你想要 1min bar，常见做法是：
-      1) 用 5 secs 更新流
-      2) 在策略/数据层做 resample 到 1min
-    """
 
+class IBKRRealtimeBarFeed(BaseDataFeed):
+    """
+    订阅 IBKR 5秒 realtime bars，并聚合到目标周期（默认 1min）。
+    """
     def __init__(
         self,
-        contracts: Dict[str, IBKRContractSpec],
-        duration_str: str = "1 D",
-        bar_size: str = "5 secs",
+        symbols: List[str],
+        conn: IBKRConnConfig_Live = IBKRConnConfig_Live(),
+        agg_rule: str = "1min",
         what_to_show: str = "TRADES",
         use_rth: bool = False,
-        conn: IBKRConnConfig = IBKRConnConfig(),
         queue_size: int = 20000,
     ) -> None:
-        self.contracts = contracts
-        self.duration_str = duration_str
-        self.bar_size = bar_size
+        self.symbols = symbols
+        self.conn = conn
         self.what_to_show = what_to_show
         self.use_rth = use_rth
-        self.conn = conn
 
         self._last_market_data: Dict[str, MarketDataEvent] = {}
         self._q: "queue.Queue[Dict[str, MarketDataEvent]]" = queue.Queue(maxsize=queue_size)
 
-        self._ib = IB()
-        self._ib.connect(self.conn.host, self.conn.port, clientId=self.conn.client_id)
+        self._agg = BarAggregator(AggConfig(rule=agg_rule))
 
-        # 订阅 keepUpToDate 的历史bar（每个 symbol 一个订阅）
-        self._subscriptions = {}
-        for sym, spec in self.contracts.items():
-            c = _to_contract(spec)
+        self._ib = IB()
+        self._ib.connect(conn.host, conn.port, clientId=conn.client_id, readonly=True)
+
+        self._subs = {}
+        for sym in symbols:
+            c = Stock(sym, "SMART", "USD")
+            # bars = self._ib.reqRealTimeBars(c, 5, what_to_show, use_rth)
             bars = self._ib.reqHistoricalData(
                 c,
                 endDateTime="",
-                durationStr=self.duration_str,
-                barSizeSetting=self.bar_size,
-                whatToShow=self.what_to_show,
-                useRTH=self.use_rth,
+                durationStr="1800 S",        # 先拿最近 30min，避免太长触发 pacing
+                barSizeSetting="5 secs",
+                whatToShow=what_to_show,     # "TRADES" / "MIDPOINT" 等
+                useRTH=use_rth,
                 formatDate=1,
-                keepUpToDate=True,
+                keepUpToDate=True
             )
-            # bars.updateEvent 每次更新会触发（ib_insync notebook 有示例思路）
             bars.updateEvent += self._make_on_update(sym, bars)
-            self._subscriptions[sym] = bars
+            self._subs[sym] = bars
 
     @property
     def last_market_data(self) -> Dict[str, MarketDataEvent]:
@@ -188,38 +186,35 @@ class IBKRLiveBarDataFeed(BaseDataFeed):
 
     def close(self) -> None:
         try:
-            # 取消订阅（简单处理：直接断开）
             self._ib.disconnect()
         except Exception:
             pass
 
     def _make_on_update(self, sym: str, bars):
         def _on_update(*_):
-            # bars 里最后一个元素就是最新bar（可能是“正在形成的bar”）
             if not bars:
                 return
             b = bars[-1]
-            ts = b.date
-            bar = Bar(
-                open=float(b.open),
-                high=float(b.high),
-                low=float(b.low),
-                close=float(b.close),
-                volume=float(getattr(b, "volume", 0.0) or 0.0),
-            )
-            evt = MarketDataEvent(
+            ev = MarketDataEvent(
                 type=EventType.MARKET,
-                timestamp=ts,
+                timestamp=b.time,
                 symbol=sym,
-                bar=bar,
-                extra=None,
+                bar=Bar(
+                    open=float(b.open),
+                    high=float(b.high),
+                    low=float(b.low),
+                    close=float(b.close),
+                    volume=float(getattr(b, "volume", 0.0) or 0.0),
+                ),
+                extra={"src": "ibkr_realtime_5s"},
             )
-            events = {sym: evt}
-            try:
-                self._q.put_nowait(events)
-            except queue.Full:
-                # 队列满就丢弃（或你可以改成覆盖旧数据）
-                pass
+
+            out = self._agg.push(ev)
+            if out is not None:
+                try:
+                    self._q.put_nowait({sym: out})
+                except queue.Full:
+                    pass
         return _on_update
 
     def __iter__(self) -> Iterator[Dict[str, MarketDataEvent]]:

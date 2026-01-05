@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from backtesting.engine import BacktestEngine
-from strategies.sample_buy_and_hold.main import BuyAndHoldOnceStrategy
+from strategies.buy_hold import BuyAndHoldOnceStrategy
 
 from portfolio.construction import WeightedByHintPC
 from portfolio.risk import MaxGrossExposureRiskModel, MaxPositionWeightRiskModel

@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
-
-from algorithm.base import BaseAlgorithm
+from pathlib import Path
+from strategies.base import BaseAlgorithm
 from core.events import MarketDataEvent, FillEvent, OrderEvent
 from data.base import BaseDataFeed
 from brokerage.base import BaseBrokerage
@@ -33,6 +33,8 @@ from portfolio.models import Insight, InsightDirection, PortfolioTarget
 from portfolio.construction import BasePortfolioConstructionModel
 from portfolio.risk import BaseRiskManagementModel
 from portfolio.execution import BaseExecutionModel
+import pandas as pd
+from analytics.journal import TradeJournal
 
 
 @dataclass
@@ -63,6 +65,9 @@ class Engine:
         exec_model: BaseExecutionModel,
         *,
         keep_insights_active: bool = True,
+        journal: TradeJournal | None = None,
+        db_path: str = "artifacts/trades.db",
+        run_id: str | None = None,
     ) -> None:
         self.algorithm = algorithm
         self.data_feed = data_feed
@@ -86,7 +91,11 @@ class Engine:
         self.algorithm.set_engine(self)
         self.brokerage.set_engine(self)
         self.exec_model.set_engine(self)
-
+        # 交易日志
+        # ✅ journal
+        # Path("artifacts").mkdir(parents=True, exist_ok=True)
+        # self.run_id = run_id or f"bt_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+        # self.journal = journal or TradeJournal(db_path=db_path, run_id=self.run_id)
     # ---------------------------------------------------------------------
     # 给 ExecutionModel 调用：发单给 Brokerage
     # ---------------------------------------------------------------------
@@ -97,7 +106,19 @@ class Engine:
         """
         self.brokerage.place_order(order_event)
         self.order_log.append(order_event)
-
+        # ✅ 记录订单状态：SUBMITTED
+        ts = getattr(order_event, "timestamp", None) or self.current_time
+        self.journal.log_order(
+            ts=ts,
+            order_id=str(getattr(order_event, "order_id", id(order_event))),
+            symbol=str(getattr(order_event, "symbol", "")),
+            side=str(getattr(order_event, "side", "")),
+            qty=float(getattr(order_event, "quantity", getattr(order_event, "qty", 0.0))),
+            order_type=str(getattr(order_event, "order_type", "MKT")),
+            status=str(getattr(order_event, "status", "SUBMITTED")),
+            limit_price=getattr(order_event, "limit_price", None),
+            payload=order_event,
+        )
     # ---------------------------------------------------------------------
     # 处理成交：更新 Portfolio
     # ---------------------------------------------------------------------
@@ -107,6 +128,18 @@ class Engine:
         """
         self.portfolio.update_from_fill(fill)
         self.fill_log.append(fill)
+        ts = getattr(fill, "timestamp", None) or self.current_time
+        self.journal.log_fill(
+            ts=ts,
+            fill_id=str(getattr(fill, "fill_id", id(fill))),
+            order_id=str(getattr(fill, "order_id", "")),
+            symbol=str(getattr(fill, "symbol", "")),
+            side=str(getattr(fill, "side", "")),
+            qty=float(getattr(fill, "quantity", getattr(fill, "qty", 0.0))),
+            price=float(getattr(fill, "price", 0.0)),
+            commission=float(getattr(fill, "commission", 0.0)),
+            payload=fill,
+        )
     # ---------------------------------------------------------------------
     # Insight 缓存（轻量 InsightManager）
     # ---------------------------------------------------------------------
@@ -150,7 +183,50 @@ class Engine:
         """
         self._update_active_insights(new_insights)
         return list(self._active_insights.values())
+    
+    def step(self, market_slice: Dict[str, MarketDataEvent]) -> Optional[EngineRecord]:
+        """
+        处理一个时间步（一个 market_slice），返回一条 EngineRecord。
+        LiveRunner 会循环调用它。
+        """
+        if not market_slice:
+            return None
 
+        self.current_time = next(iter(market_slice.values())).timestamp
+        last_prices = {sym: float(ev.bar.close) for sym, ev in market_slice.items()}
+
+        # 更新给 risk / stats 用
+        self.portfolio.update_prices(last_prices)
+
+        # Strategy -> Insights
+        new_insights = self.algorithm.on_data(market_slice) or []
+        insights = self._get_effective_insights(new_insights)
+
+        # PC -> targets
+        targets = self.pc_model.create_targets(self.portfolio, insights)
+
+        # Risk -> adjusted targets
+        adj_targets = self.risk_model.manage_risk(self.portfolio, targets)
+
+        # 如果触发停机（Kill-switch等），跳过执行
+        if not getattr(self, "halt_trading", False) and not getattr(self.portfolio, "halt_trading", False):
+            self.exec_model.execute(self.portfolio, adj_targets, last_prices)
+
+        # fills -> portfolio
+        fills = self.brokerage.get_fills()
+        for fill in fills:
+            self.handle_fill(fill)
+
+        snap = self.portfolio.snapshot(last_prices)
+        rec = EngineRecord(
+            timestamp=self.current_time,
+            cash=snap["cash"],
+            equity=snap["equity"],
+            realized_pnl=snap.get("realized_pnl", 0.0),
+            positions=snap["positions"],
+        )
+        self.records.append(rec)
+        return rec
     # ---------------------------------------------------------------------
     # 主循环：跑完整个 DataFeed
     # ---------------------------------------------------------------------
@@ -164,47 +240,85 @@ class Engine:
         # 2) 遍历历史行情（或实盘事件流）
         
         for market_slice in self.data_feed:
-            # import ipdb; ipdb.set_trace()
-            if not market_slice:
-                continue
-
-            # 当前时间：取 slice 里任意一个 symbol 的 timestamp
-            self.current_time = next(iter(market_slice.values())).timestamp
-
-            # 最新价格：用于估值 & 执行模型换算目标股数
-            last_prices = {sym: ev.bar.close for sym, ev in market_slice.items()}
-            self.portfolio.update_prices({k: float(v) for k, v in last_prices.items()})   
-            
-            # 2.1 策略生成 Insights
-            new_insights = self.algorithm.on_data(market_slice) or []
-
-            # 2.2 形成“有效 insights”（含缓存）
-            insights = self._get_effective_insights(new_insights)
-
-            # 2.3 组合构建：Insights -> Targets
-            targets: List[PortfolioTarget] = self.pc_model.create_targets(self.portfolio, insights)
-
-            # 2.4 风险管理：Targets -> Adjusted Targets
-            adj_targets: List[PortfolioTarget] = self.risk_model.manage_risk(self.portfolio, targets)
-
-            # 2.5 执行：Adjusted Targets -> Orders（由 ExecutionModel 发单）
-            self.exec_model.execute(self.portfolio, adj_targets, last_prices)
-
-            # 2.6 拉取成交并更新组合
-            fills = self.brokerage.get_fills()
-            for fill in fills:
-                self.handle_fill(fill)
-                
-                # 记录订单（可选）
-            # 2.7 记录结果（现金、净值、仓位）
-            snapshot = self.portfolio.snapshot(last_prices)
-            self.records.append(
-                EngineRecord(
-                    timestamp=self.current_time,
-                    cash=snapshot["cash"],
-                    equity=snapshot["equity"],
-                    positions=snapshot["positions"],
-                )
-            )
-
+            self.step(market_slice)
         return self.records
+    # def run(self) -> List[EngineRecord]:
+    #     self.algorithm.initialize()
+
+    #     try:
+    #         for market_slice in self.data_feed:
+    #             if not market_slice:
+    #                 continue
+
+    #             self.current_time = next(iter(market_slice.values())).timestamp
+
+    #             # ✅ 先把每个 symbol 的 bar 写入 bars 表（画K线用）
+    #             for sym, ev in market_slice.items():
+    #                 bar = ev.bar
+    #                 self.journal.log_bar(
+    #                     ts=ev.timestamp,
+    #                     symbol=str(sym),
+    #                     o=float(getattr(bar, "open", bar.close)),
+    #                     h=float(getattr(bar, "high", bar.close)),
+    #                     l=float(getattr(bar, "low", bar.close)),
+    #                     c=float(getattr(bar, "close", bar.close)),
+    #                     v=float(getattr(bar, "volume", 0.0)),
+    #                 )
+
+    #             # 最新价格
+    #             last_prices = {sym: ev.bar.close for sym, ev in market_slice.items()}
+    #             self.portfolio.update_prices({k: float(v) for k, v in last_prices.items()})
+
+    #             # ✅ 记录一个“MARKET”事件（时间线复盘用，可选但很有用）
+    #             self.journal.log_event(ts=self.current_time, etype="MARKET_SLICE", payload={"symbols": list(market_slice.keys())})
+
+    #             # 2.1 策略生成 Insights
+    #             new_insights = self.algorithm.on_data(market_slice) or []
+    #             self.journal.log_event(ts=self.current_time, etype="INSIGHTS", payload=[i for i in new_insights])
+
+    #             # 2.2 有效 insights
+    #             insights = self._get_effective_insights(new_insights)
+
+    #             # 2.3 Insights -> Targets
+    #             targets = self.pc_model.create_targets(self.portfolio, insights)
+    #             self.journal.log_event(ts=self.current_time, etype="TARGETS", payload=[t for t in targets])
+
+    #             # 2.4 风险
+    #             adj_targets = self.risk_model.manage_risk(self.portfolio, targets)
+    #             self.journal.log_event(ts=self.current_time, etype="ADJ_TARGETS", payload=[t for t in adj_targets])
+
+    #             # 2.5 执行（内部会调用 emit_order -> 已记录 orders）
+    #             self.exec_model.execute(self.portfolio, adj_targets, last_prices)
+
+    #             # 2.6 成交（handle_fill 已记录 fills）
+    #             fills = self.brokerage.get_fills()
+    #             for fill in fills:
+    #                 self.handle_fill(fill)
+
+    #             # 2.7 记录结果（你的原始 records 继续保留）
+    #             snapshot = self.portfolio.snapshot(last_prices)
+    #             self.records.append(
+    #                 EngineRecord(
+    #                     timestamp=self.current_time,
+    #                     cash=snapshot["cash"],
+    #                     equity=snapshot["equity"],
+    #                     positions=snapshot["positions"],
+    #                 )
+    #             )
+
+    #             # ✅ 同步写入 snapshots 表（画 equity / drawdown / positions 过程用）
+    #             self.journal.log_snapshot(
+    #                 ts=self.current_time,
+    #                 equity=float(snapshot["equity"]),
+    #                 cash=float(snapshot["cash"]),
+    #                 gross_exposure=0.0,   # 你有就换成 portfolio.gross_exposure()
+    #                 net_exposure=0.0,     # 你有就换成 portfolio.net_exposure()
+    #                 positions=snapshot["positions"],
+    #             )
+
+    #         return self.records
+
+    #     finally:
+    #         # ✅ 结束时关闭 DB，保证写入落盘
+    #         self.journal.close()
+

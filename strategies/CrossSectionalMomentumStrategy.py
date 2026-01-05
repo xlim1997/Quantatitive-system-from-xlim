@@ -5,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-from algorithm.base import BaseAlgorithm
+from strategies.base import BaseAlgorithm
 from core.events import MarketDataEvent
 from portfolio.models import Insight, InsightDirection
 

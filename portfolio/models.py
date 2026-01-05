@@ -19,10 +19,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
-
+from typing import Any, Dict
 
 # ---------------------------------------------------------------------------
 # 1. InsightDirection：策略观点的方向（看多 / 看空 / 中性）
@@ -71,9 +71,16 @@ class Insight:
     - Algorithm.on_data(...) 返回 List[Insight]
     - PortfolioConstructionModel 根据这些 Insight 设计组合。
     """
+    
     symbol: str
-    direction: InsightDirection
-    weight_hint: float
+    direction: int               # +1/-1/0（你现在用 UP/DOWN 也行，本质要能转成符号）
+    weight_hint: float = 0.0     # 目标权重提示（可正可负）
+
+    # ---- 新增：全部都有默认值 => 不会破坏旧代码 ----
+    confidence: float = 1.0
+    horizon_bars: int = 1
+    source: str = ""
+    meta: Dict[str, Any] = field(default_factory=dict)
     expiry: Optional[object] = None  # 现在可以不管，后续高级用法
 
 

@@ -7,7 +7,7 @@ from backtesting.performance import compute_performance
 from portfolio.construction import WeightedByHintPC
 from portfolio.execution import ImmediateExecutionModel
 
-from strategies.momentum.main import CrossSectionalMomentumStrategy, MomentumConfig
+from strategies.CrossSectionalMomentumStrategy import CrossSectionalMomentumStrategy, MomentumConfig
 from data.ibkr_feed import IBKRHistoryBarDataFeed, IBKRContractSpec, IBKRConnConfig
 from data.futu_feed import FutuHistoryKlineDataFeed, FutuConnConfig
 from backtesting.trade_stats import compute_turnover, summarize_trades
@@ -24,7 +24,8 @@ from brokerage.paper import PaperBrokerage
 def main():
     # 1) Universe（先用 5-20 个股票跑通，后面再扩）
     universe = [
-        "AAPL", "MSFT", "AMZN", "GOOG", "META","NFLX","NVDA","TSLA","AMD","INTC",
+        "AAPL", "MSFT", "AMZN", "GOOG", "META","NFLX","NVDA","TSLA",
+        # "NDX"
         # 你可以继续加：NVDA, TSLA, AMD ...
     ]
 
@@ -56,10 +57,18 @@ def main():
     # IBKR DATA FEED
     contracts = {symbol: IBKRContractSpec(symbol=symbol) for symbol in universe}
     # 4) DataFeed (IBKR)
+    # durationStr: Time span of all the bars. Examples:
+    #             '60 S', '30 D', '13 W', '6 M', '10 Y'.
+    # barSizeSetting: Time period of one bar. Must be one of:
+    #             '1 secs', '5 secs', '10 secs' 15 secs', '30 secs',
+    #             '1 min', '2 mins', '3 mins', '5 mins', '10 mins', '15 mins',
+    #             '20 mins', '30 mins',
+    #             '1 hour', '2 hours', '3 hours', '4 hours', '8 hours',
+    #             '1 day', '1 week', '1 month'.
     contracts = {sym: IBKRContractSpec(symbol=sym) for sym in universe}
     data_feed = IBKRHistoryBarDataFeed(
         contracts=contracts,
-        duration_str="2 Y",
+        duration_str="6 M",
         bar_size="1 day",
         what_to_show="ADJUSTED_LAST",
         use_rth=True,
@@ -70,7 +79,8 @@ def main():
             client_id=1,
         ),
     )
-
+    # 5) Backtest 引擎
+    
     bt = Backtest(
         algorithm=algo,
         data_feed=data_feed,
