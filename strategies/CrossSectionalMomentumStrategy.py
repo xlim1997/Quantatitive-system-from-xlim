@@ -99,7 +99,7 @@ class CrossSectionalMomentumStrategy(BaseAlgorithm):
 
             stop = (self.cfg.stop_loss_pct is not None and ret <= -float(self.cfg.stop_loss_pct))
             take = (self.cfg.take_profit_pct is not None and ret >= float(self.cfg.take_profit_pct))
-
+            
             # 最大持仓 bars（用进入 bar index 近似）
             max_hold = False
             if self.cfg.max_holding_bars is not None:

@@ -20,7 +20,7 @@ from portfolio.risk import (
 )
 from portfolio.state import Portfolio
 from brokerage.paper import PaperBrokerage
-
+from universe.symbol_list import symbols_nasdaq_100, symbols_sp500
 def main():
     # 1) Universe（先用 5-20 个股票跑通，后面再扩）
     universe = [
@@ -28,7 +28,7 @@ def main():
         # "NDX"
         # 你可以继续加：NVDA, TSLA, AMD ...
     ]
-
+    # universe = symbols_nasdaq_100[:5]
     # 2) Strategy
     cfg = MomentumConfig(
         universe=universe,
@@ -44,9 +44,9 @@ def main():
     # 3) 三模型
     pc_model = WeightedByHintPC(normalize_gross=True, gross_cap=1.0)
     risk_model = ChainRiskManagementModel([
-        StopLossRiskModel(stop_loss_pct=0.10, take_profit_pct=0.05),  # 风控层退出
-        PortfolioMaxDrawdownRiskModel(max_drawdown=0.2),             # 组合回撤保护
-        MaxPositionWeightRiskModel(max_weight=0.1),                  # 单票限制
+        StopLossRiskModel(stop_loss_pct=0.02),  # 风控层退出
+        PortfolioMaxDrawdownRiskModel(max_drawdown=0.08),             # 组合回撤保护
+        MaxPositionWeightRiskModel(max_weight=0.5),                  # 单票限制
         MaxGrossExposureRiskModel(max_gross_exposure=1.0),            # 总曝险限制
     ])
     # 你也可以叠加单票限制：先用 MaxPositionWeightRiskModel 放在 risk.py 里串联（后面我给你做组合 risk chain）
@@ -68,9 +68,9 @@ def main():
     contracts = {sym: IBKRContractSpec(symbol=sym) for sym in universe}
     data_feed = IBKRHistoryBarDataFeed(
         contracts=contracts,
-        duration_str="6 M",
+        duration_str="2 Y",
         bar_size="1 day",
-        what_to_show="ADJUSTED_LAST",
+        what_to_show="TRADES",
         use_rth=True,
         end_datetime="",  # "" means now
         conn=IBKRConnConfig_Historical(
@@ -116,7 +116,9 @@ def main():
     print("\n=== Performance ===")
     for k, v in perf.items():
         print(f"{k:>20}: {v}")
-    
+    print("\n=== Equity Curve ===")
+    # print(df[["timestamp", "equity"]])
+    print(df)
 
 if __name__ == "__main__":
     main()

@@ -1,22 +1,7 @@
 # portfolio/execution.py
-"""
-执行模型（Execution Model）
-=========================
-
-职责：
-- 把最终的目标权重（Adjusted Targets）转成具体订单（OrderEvent）
-- 订单交给 Engine.emit_order() -> Brokerage.place_order() 执行
-
-关键点：
-- ExecutionModel 不负责决定“目标权重”，它只负责把目标变成单子
-- 未来可以在这里实现：
-  - TWAP/VWAP 分批执行
-  - 根据 bid/ask spread 决定成交价格
-  - 限价单挂单策略
-"""
-
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, TYPE_CHECKING
 
@@ -42,25 +27,54 @@ class BaseExecutionModel(ABC):
         targets: List[PortfolioTarget],
         last_prices: Dict[str, float],
     ) -> None:
-        """
-        把 targets 转成订单，并交给引擎发送给 Brokerage。
-        """
         ...
 
 
 class ImmediateExecutionModel(BaseExecutionModel):
     """
-    最简单的执行模型：
-    - 一次性把当前仓位调整到目标仓位（按目标权重换算成目标市值 -> 目标股数）
-    - 生成市价单（MARKET）
-
-    参数：
-    - min_trade_value: 小于该金额的调仓忽略（避免频繁小单）
+    修复要点：
+    1) 强制清仓（target=0）时：qty = -current_qty（不走 diff/price，避免 int 截断残股）
+    2) SELL 先执行，再 BUY（释放现金）
+    3) BUY 受现金约束（避免 cash 变负），可留现金 buffer
+    4) |target_percent| 很小视为 0（避免权重抖动造成尘埃单）
     """
 
-    def __init__(self, min_trade_value: float = 0.0) -> None:
+    def __init__(
+        self,
+        min_trade_value: float = 0.0,
+        cash_buffer_pct: float = 0.0,      # 例如 0.005 表示留 0.5% 现金
+        allow_margin: bool = False,
+        eps_weight: float = 1e-10,
+        commission_per_share: float = 0.0, # 如果你没有佣金模型，就保持 0
+        min_commission: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.min_trade_value = min_trade_value
+        self.min_trade_value = float(min_trade_value)
+        self.cash_buffer_pct = float(cash_buffer_pct)
+        self.allow_margin = bool(allow_margin)
+        self.eps_weight = float(eps_weight)
+        self.commission_per_share = float(commission_per_share)
+        self.min_commission = float(min_commission)
+
+    def _est_commission(self, qty: int, price: float) -> float:
+        # 只是“估算”，用于限制买入不超现金；真实佣金以 FillEvent 为准
+        c = abs(qty) * self.commission_per_share
+        return max(self.min_commission, c)
+
+    def _max_affordable_buy_qty(self, cash: float, price: float, desired_qty: int) -> int:
+        if desired_qty <= 0 or cash <= 0 or price <= 0:
+            return 0
+        budget = cash * (1.0 - self.cash_buffer_pct)
+
+        lo, hi = 0, desired_qty
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            cost = mid * price + self._est_commission(mid, price)
+            if cost <= budget + 1e-9:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
     def execute(
         self,
@@ -71,51 +85,88 @@ class ImmediateExecutionModel(BaseExecutionModel):
         if self._engine is None:
             raise RuntimeError("ExecutionModel has no engine attached.")
 
-        # 当前组合净值
         equity = portfolio.total_value(last_prices)
+        target_map = {t.symbol: float(t.target_percent) for t in targets}
 
-        # 将 targets 转为 dict，方便查找
-        target_map = {t.symbol: t.target_percent for t in targets}
+        symbols_union = set(portfolio.positions.keys()) | set(target_map.keys())
 
-        # 处理“既有持仓但 target 没给”的情况：
-        # - 这意味着目标是 0（需要清仓）
-        symbols_union = set(list(portfolio.positions.keys()) + list(target_map.keys()))
+        sells: List[tuple[str, int, float]] = []
+        buys: List[tuple[str, int, float]] = []
 
         for symbol in symbols_union:
             price = last_prices.get(symbol)
             if price is None or price <= 0:
-                # 没价格就无法换算目标股数
                 continue
 
-            target_percent = target_map.get(symbol, 0.0)
-            target_value = equity * target_percent
+            pos = portfolio.positions.get(symbol)
+            current_qty = 0 if pos is None else int(round(pos.quantity))
 
-            current_pos = portfolio.positions.get(symbol)
-            current_qty = 0.0 if current_pos is None else current_pos.quantity
-            current_value = current_qty * price
+            w = target_map.get(symbol, 0.0)
+            if abs(w) <= self.eps_weight:
+                w = 0.0
 
-            diff_value = target_value - current_value
-
-            # 忽略太小的调仓
-            if abs(diff_value) < self.min_trade_value:
+            # --- 关键：强制清仓不留残股 ---
+            if w == 0.0 and current_qty != 0:
+                order_qty = -current_qty
+                sells.append((symbol, order_qty, price))
                 continue
 
-            # 目标差额换算成股数（整数股）
-            qty = int(diff_value / price)
-            if qty == 0:
+            # 非强制清仓：用目标权重换算目标股数
+            target_value = equity * w
+            target_qty = int(math.floor(target_value / price)) if target_value > 0 else 0
+
+            order_qty = target_qty - current_qty
+            if order_qty == 0:
                 continue
 
-            side = OrderSide.BUY if qty > 0 else OrderSide.SELL
+            trade_value = abs(order_qty) * price
+            if trade_value < self.min_trade_value:
+                continue
+
+            if order_qty < 0:
+                sells.append((symbol, order_qty, price))
+            else:
+                buys.append((symbol, order_qty, price))
+
+        # 先卖出释放现金
+        cash_sim = float(portfolio.cash)
+
+        for symbol, qty, price in sells:
+            fee = self._est_commission(qty, price)
+            proceeds = (-qty) * price - fee
+            cash_sim += proceeds
 
             order = OrderEvent(
                 type=EventType.ORDER,
                 timestamp=self._engine.current_time,
                 symbol=symbol,
-                quantity=qty,
-                side=side,
+                quantity=qty,            # qty 为负
+                side=OrderSide.SELL,
                 order_type=OrderType.MARKET,
                 tag="ImmediateExec",
             )
+            self._engine.emit_order(order)
 
-            # 交给引擎发送给 Brokerage
+        # 再买入（若不允许保证金，就按现金约束）
+        for symbol, desired_qty, price in buys:
+            qty = desired_qty
+            if not self.allow_margin:
+                qty = self._max_affordable_buy_qty(cash_sim, price, desired_qty)
+
+            if qty <= 0:
+                continue
+
+            fee = self._est_commission(qty, price)
+            cost = qty * price + fee
+            cash_sim -= cost
+
+            order = OrderEvent(
+                type=EventType.ORDER,
+                timestamp=self._engine.current_time,
+                symbol=symbol,
+                quantity=qty,            # qty 为正
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                tag="ImmediateExec",
+            )
             self._engine.emit_order(order)

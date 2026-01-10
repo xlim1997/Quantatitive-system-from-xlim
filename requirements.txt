@@ -14,3 +14,6 @@ ib-insync
 futu-api
 python-binance
 yfinance
+# visualization dashboard
+streamlit
+plotly

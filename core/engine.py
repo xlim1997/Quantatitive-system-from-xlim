@@ -48,6 +48,8 @@ class EngineRecord:
     equity: float
     positions: dict
     realized_pnl: float = 0.0
+    insights: List[Insight] = None
+    
 
 
 
@@ -67,6 +69,7 @@ class Engine:
         exec_model: BaseExecutionModel,
         *,
         keep_insights_active: bool = True,
+        enable_journal: bool = True,
         journal: TradeJournal | None = None,
         db_path: str = "artifacts/trades.db",
         run_id: str | None = None,
@@ -93,11 +96,15 @@ class Engine:
         self.algorithm.set_engine(self)
         self.brokerage.set_engine(self)
         self.exec_model.set_engine(self)
-        # 交易日志
-        # ✅ journal
-        # Path("artifacts").mkdir(parents=True, exist_ok=True)
-        # self.run_id = run_id or f"bt_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
-        # self.journal = journal or TradeJournal(db_path=db_path, run_id=self.run_id)
+        self.step_count = 0
+        # 交易日志（用于可视化复盘）
+        self.enable_journal = bool(enable_journal)
+        self.run_id = run_id or f"bt_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+        self.journal: TradeJournal | None = None
+        if self.enable_journal:
+            Path("artifacts").mkdir(parents=True, exist_ok=True)
+            self.journal = journal or TradeJournal(db_path=db_path, run_id=self.run_id)
+
     # ---------------------------------------------------------------------
     # 给 ExecutionModel 调用：发单给 Brokerage
     # ---------------------------------------------------------------------
@@ -110,17 +117,19 @@ class Engine:
         self.order_log.append(order_event)
         # ✅ 记录订单状态：SUBMITTED
         ts = getattr(order_event, "timestamp", None) or self.current_time
-        # self.journal.log_order(
-        #     ts=ts,
-        #     order_id=str(getattr(order_event, "order_id", id(order_event))),
-        #     symbol=str(getattr(order_event, "symbol", "")),
-        #     side=str(getattr(order_event, "side", "")),
-        #     qty=float(getattr(order_event, "quantity", getattr(order_event, "qty", 0.0))),
-        #     order_type=str(getattr(order_event, "order_type", "MKT")),
-        #     status=str(getattr(order_event, "status", "SUBMITTED")),
-        #     limit_price=getattr(order_event, "limit_price", None),
-        #     payload=order_event,
-        # )
+        if self.journal is not None:
+            self.journal.log_order(
+                ts=ts,
+                order_id=str(getattr(order_event, "order_id", id(order_event))),
+                symbol=str(getattr(order_event, "symbol", "")),
+                side=str(getattr(order_event, "side", "")),
+                qty=float(getattr(order_event, "quantity", getattr(order_event, "qty", 0.0))),
+                order_type=str(getattr(order_event, "order_type", "MKT")),
+                status=str(getattr(order_event, "status", "SUBMITTED")),
+                limit_price=getattr(order_event, "limit_price", None),
+                payload=order_event,
+            )
+
     # ---------------------------------------------------------------------
     # 处理成交：更新 Portfolio
     # ---------------------------------------------------------------------
@@ -131,17 +140,38 @@ class Engine:
         self.portfolio.update_from_fill(fill)
         self.fill_log.append(fill)
         ts = getattr(fill, "timestamp", None) or self.current_time
-        # self.journal.log_fill(
-        #     ts=ts,
-        #     fill_id=str(getattr(fill, "fill_id", id(fill))),
-        #     order_id=str(getattr(fill, "order_id", "")),
-        #     symbol=str(getattr(fill, "symbol", "")),
-        #     side=str(getattr(fill, "side", "")),
-        #     qty=float(getattr(fill, "quantity", getattr(fill, "qty", 0.0))),
-        #     price=float(getattr(fill, "price", 0.0)),
-        #     commission=float(getattr(fill, "commission", 0.0)),
-        #     payload=fill,
-        # )
+        if self.journal is not None:
+            self.journal.log_fill(
+                ts=ts,
+                fill_id=str(getattr(fill, "fill_id", id(fill))),
+                order_id=str(getattr(fill, "order_id", "")),
+                symbol=str(getattr(fill, "symbol", "")),
+                side=str(getattr(fill, "side", "")),
+                qty=float(getattr(fill, "quantity", getattr(fill, "qty", 0.0))),
+                price=float(getattr(fill, "price", 0.0)),
+                commission=float(getattr(fill, "commission", 0.0)),
+                payload=fill,
+            )
+
+
+    def _drop_active_insights_on_forced_flat(self, adj_targets: List[PortfolioTarget]) -> None:
+        """
+        若风控强制把某个“当前有仓位”的标的 target=0，则清掉 active insight，
+        这样才能支持：
+          1) 策略只给入场信号（不负责出场）
+          2) 风控出场后，必须允许未来再次入场（由新信号触发）
+        """
+        for t in adj_targets:
+            if float(t.target_percent) != 0.0:
+                continue
+            pos = self.portfolio.positions.get(t.symbol)
+            if pos is None:
+                continue
+            if float(pos.quantity) == 0.0:
+                continue
+            # ✅ 有仓位且被风控要求清仓 -> 删掉 active insight
+            self._active_insights.pop(t.symbol, None)
+
     # ---------------------------------------------------------------------
     # Insight 缓存（轻量 InsightManager）
     # ---------------------------------------------------------------------
@@ -200,16 +230,56 @@ class Engine:
         # 更新给 risk / stats 用
         self.portfolio.update_prices(last_prices)
 
+        # Journal: log bars (for candlestick)
+        if self.journal is not None:
+            for sym, ev in market_slice.items():
+                try:
+                    b = ev.bar
+                    self.journal.log_bar(
+                        ts=self.current_time,
+                        symbol=sym,
+                        o=float(getattr(b, "open", getattr(b, "o", 0.0))),
+                        h=float(getattr(b, "high", getattr(b, "h", 0.0))),
+                        l=float(getattr(b, "low", getattr(b, "l", 0.0))),
+                        c=float(getattr(b, "close", getattr(b, "c", 0.0))),
+                        v=float(getattr(b, "volume", getattr(b, "v", 0.0))),
+                    )
+                except Exception:
+                    pass
+
         # Strategy -> Insights
         new_insights = self.algorithm.on_data(market_slice) or []
+        if self.journal is not None:
+            for ins in new_insights:
+                self.journal.log_event(ts=self.current_time, etype="INSIGHT", symbol=getattr(ins, "symbol", ""), payload=ins)
         insights = self._get_effective_insights(new_insights)
 
         # PC -> targets
         targets = self.pc_model.create_targets(self.portfolio, insights)
+        if self.journal is not None:
+            for t in targets:
+                self.journal.log_event(ts=self.current_time, etype="TARGET", symbol=getattr(t, "symbol", ""), payload=t)
 
         # Risk -> adjusted targets
         adj_targets = self.risk_model.manage_risk(self.portfolio, targets)
-
+        if self.journal is not None:
+            for t in adj_targets:
+                self.journal.log_event(ts=self.current_time, etype="ADJ_TARGET", symbol=getattr(t, "symbol", ""), payload=t)
+        # ---- risk actions (side-channel) for dashboard timeline ----
+        if self.journal is not None:
+            acts = getattr(self.risk_model, "last_actions", None)
+            if acts:
+                for a in acts:
+                    try:
+                        sym = ""
+                        if isinstance(a, dict):
+                            sym = str(a.get("symbol", ""))
+                        self.journal.log_event(ts=self.current_time, etype="RISK_ACTION", symbol=sym, payload=a)
+                    except Exception:
+                        pass
+        # print(f"Engine Step @ {self.current_time}: Generated {len(insights)} insights, {len(targets)} targets, {len(adj_targets)} adjusted targets.")
+        if self.keep_insights_active:
+            self._drop_active_insights_on_forced_flat(adj_targets)
         # 如果触发停机（Kill-switch等），跳过执行
         if not getattr(self, "halt_trading", False) and not getattr(self.portfolio, "halt_trading", False):
             self.exec_model.execute(self.portfolio, adj_targets, last_prices)
@@ -220,14 +290,33 @@ class Engine:
             self.handle_fill(fill)
 
         snap = self.portfolio.snapshot(last_prices)
+        if self.journal is not None:
+            try:
+                self.journal.log_snapshot(
+                    ts=self.current_time,
+                    equity=float(snap.get("equity", 0.0)),
+                    cash=float(snap.get("cash", 0.0)),
+                    positions=snap.get("positions", {}),
+                )
+            except Exception:
+                pass
         rec = EngineRecord(
             timestamp=self.current_time,
             cash=snap["cash"],
             equity=snap["equity"],
             realized_pnl=snap.get("realized_pnl", 0.0),
             positions=snap["positions"],
+            insights=insights,
+            
         )
         self.records.append(rec)
+        self.step_count += 1
+        if self.step_count <= 100:
+            print("----- Engine Step Record -----")
+            print(f"new_insights: {new_insights}")
+            print(f"Engine Step @ {self.current_time}: Cash={rec.cash:.2f}, Equity={rec.equity:.2f}, Positions={len(rec.positions)}, Insights={len(rec.insights)}")
+
+            # import ipdb; ipdb.set_trace()
         return rec
     # ---------------------------------------------------------------------
     # 主循环：跑完整个 DataFeed
@@ -243,6 +332,8 @@ class Engine:
         
         for market_slice in self.data_feed:
             self.step(market_slice)
+        if self.journal is not None:
+            self.journal.close()
         return self.records
     # def run(self) -> List[EngineRecord]:
     #     self.algorithm.initialize()
@@ -276,6 +367,9 @@ class Engine:
 
     #             # 2.1 策略生成 Insights
     #             new_insights = self.algorithm.on_data(market_slice) or []
+        if self.journal is not None:
+            for ins in new_insights:
+                self.journal.log_event(ts=self.current_time, etype="INSIGHT", symbol=getattr(ins, "symbol", ""), payload=ins)
     #             self.journal.log_event(ts=self.current_time, etype="INSIGHTS", payload=[i for i in new_insights])
 
     #             # 2.2 有效 insights
@@ -283,10 +377,16 @@ class Engine:
 
     #             # 2.3 Insights -> Targets
     #             targets = self.pc_model.create_targets(self.portfolio, insights)
+        if self.journal is not None:
+            for t in targets:
+                self.journal.log_event(ts=self.current_time, etype="TARGET", symbol=getattr(t, "symbol", ""), payload=t)
     #             self.journal.log_event(ts=self.current_time, etype="TARGETS", payload=[t for t in targets])
 
     #             # 2.4 风险
     #             adj_targets = self.risk_model.manage_risk(self.portfolio, targets)
+        if self.journal is not None:
+            for t in adj_targets:
+                self.journal.log_event(ts=self.current_time, etype="ADJ_TARGET", symbol=getattr(t, "symbol", ""), payload=t)
     #             self.journal.log_event(ts=self.current_time, etype="ADJ_TARGETS", payload=[t for t in adj_targets])
 
     #             # 2.5 执行（内部会调用 emit_order -> 已记录 orders）

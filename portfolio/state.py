@@ -150,7 +150,7 @@ class Portfolio:
         # 3) 反方向成交：先平仓一部分/全部，再看是否翻方向
         m = _ensure_meta_for_existing()
         new_qty = old_qty + trade_qty
-
+        # import ipdb; ipdb.set_trace()
         close_qty = min(abs(old_qty), abs(trade_qty))
         if close_qty > 0 and old_avg > 0:
             # 平仓部分的已实现盈亏（gross）
@@ -201,11 +201,12 @@ class Portfolio:
 
         # 3b) 完全平仓
         if new_qty == 0:
-            pos.quantity = 0.0
-            pos.avg_price = 0.0
-            self.positions[sym] = pos
+            # IMPORTANT: 完全平仓时，把该 symbol 从 positions 中移除，
+            # 避免出现 quantity=0 但仍留在 dict 里造成“看似还持仓”的副作用。
+            self.positions.pop(sym, None)
             self._open_meta.pop(sym, None)
             return
+
 
         # 3c) 翻方向：剩余部分开新仓（成本按当前成交价）
         open_comm = float(fill.commission) - (float(fill.commission) * (close_qty / trade_qty_abs) if trade_qty_abs > 0 else 0.0)

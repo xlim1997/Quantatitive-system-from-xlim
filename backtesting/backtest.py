@@ -36,6 +36,8 @@ class Backtest:
         brokerage: Optional[BaseBrokerage] = None,
         portfolio: Optional[Portfolio] = None,
         initial_cash: float = 100_000.0,
+        commission_model: str = "value_pct",  # "value_pct" | "per_share" | "ibkr_fixed" | "ibkr_tiered"
+        per_share: float = 0.0,
         slippage: float = 0.0,
         commission_rate: float = 0.0,
         fixed_commission: float = 0.0,
@@ -52,10 +54,15 @@ class Backtest:
 
         # Brokerage
         if brokerage is None:
+            # brokerage = PaperBrokerage(
+            #     slippage=0.0005,
+            #     commission_model="value_pct",
+            #     commission_rate=0.0002,   # 例如 0.02%
+            #     fixed_commission=0.0,
+            # )
             brokerage = PaperBrokerage(
-                slippage=slippage,
-                commission_rate=commission_rate,
-                fixed_commission=fixed_commission,
+                slippage=0.0005,
+                commission_model="ibkr_fixed",
             )
 
         # 组装你的 Engine（注意：这里完全匹配你 Engine 的签名）

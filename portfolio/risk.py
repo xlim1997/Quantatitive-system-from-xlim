@@ -37,14 +37,28 @@ class NoRiskModel(BaseRiskManagementModel):
 class ChainRiskManagementModel(BaseRiskManagementModel):
     """
     链式风控：按顺序依次应用多个 risk model。
+
+    额外：
+    - last_actions: 收集子 risk model 在本 bar 触发的动作（用于可视化复盘）。
+      这些动作不会改变 manage_risk 的返回签名，只是 side-channel。
     """
     def __init__(self, models: List[BaseRiskManagementModel]) -> None:
         self.models = models
+        self.last_actions: List[Dict] = []
 
     def manage_risk(self, portfolio: Portfolio, targets: List[PortfolioTarget]) -> List[PortfolioTarget]:
         out = targets
+        self.last_actions = []
         for m in self.models:
             out = m.manage_risk(portfolio, out)
+
+            # side-channel: collect child actions if any
+            acts = getattr(m, "last_actions", None)
+            if acts:
+                try:
+                    self.last_actions.extend(list(acts))
+                except Exception:
+                    pass
         return out
 
 
@@ -88,9 +102,12 @@ class StopLossRiskModel(BaseRiskManagementModel):
     def __init__(self, stop_loss_pct: float = 0.10, take_profit_pct: float | None = None) -> None:
         self.stop_loss_pct = float(stop_loss_pct)
         self.take_profit_pct = float(take_profit_pct) if take_profit_pct is not None else None
+        self.last_actions: List[Dict] = []
 
     def manage_risk(self, portfolio: Portfolio, targets: List[PortfolioTarget]) -> List[PortfolioTarget]:
         prices = portfolio.last_prices
+        # reset side-channel actions each bar
+        self.last_actions = []
         if not prices:
             return targets
 
@@ -117,21 +134,76 @@ class StopLossRiskModel(BaseRiskManagementModel):
 
             if stop or take:
                 target_map[sym] = 0.0  # 强制清仓
+                self.last_actions.append({
+                    "symbol": sym,
+                    "action": "FORCE_FLAT",
+                    "reason": "STOP_LOSS" if stop else "TAKE_PROFIT",
+                    "ret": float(ret),
+                    "avg_price": float(pos.avg_price),
+                    "price": float(px),
+                    "qty": float(pos.quantity),
+                    "stop_loss_pct": float(self.stop_loss_pct),
+                    "take_profit_pct": float(self.take_profit_pct) if self.take_profit_pct is not None else None,
+                })
+        # 3) 返回时用稳定顺序：先按原 targets 的顺序，再补上当前持仓但不在 targets 里的
+        ordered_syms = [t.symbol for t in targets]
+        for sym in portfolio.positions.keys():
+            if sym not in target_map:
+                # 如果策略没给该 symbol target，就不动它（不返回也行，取决于你执行层如何解释“缺失”）
+                # 如果你执行层把“缺失”当“不调整”，这里可以不加
+                pass
+            if sym not in ordered_syms and sym in target_map:
+                ordered_syms.append(sym)
 
-        return [PortfolioTarget(symbol=s, target_percent=w) for s, w in target_map.items()]
+        out: List[PortfolioTarget] = []
+        for sym in ordered_syms:
+            if sym in target_map:
+                out.append(PortfolioTarget(symbol=sym, target_percent=target_map[sym]))
+        return out
+        # return [PortfolioTarget(symbol=s, target_percent=w) for s, w in target_map.items()]
 
 
 class PortfolioMaxDrawdownRiskModel(BaseRiskManagementModel):
     """
-    组合最大回撤保护：
-    - 用 portfolio.total_value(prices) 得到当前 equity
-    - 与峰值 equity_peak 比较，回撤超过阈值则强制全清仓（targets 全部置 0）
+    组合最大回撤保护（可选：是否允许恢复交易）
+
+    原版逻辑的问题：
+      - equity_peak 一直不重置
+      - 一旦触发 dd 阈值并清仓，组合净值通常无法“自然恢复”
+        => dd 始终处于阈值之下 => targets 永远被强制 0 => 之后再也买不回
+
+    这里提供三种模式（用参数控制）：
+
+    1) halt_trading_on_trigger=True:
+         - 触发后强制清仓，并设置 portfolio.halt_trading=True
+         - 之后引擎会跳过执行（真正的 kill-switch，永不恢复，需人工解除）
+
+    2) reset_peak_on_trigger=True (推荐用于回测/自动恢复):
+         - 触发当步强制清仓
+         - 同时把 equity_peak 重置为当前 equity
+         - 下一根 bar 起允许重新交易（dd=0 从新开始）
+
+    3) 两者都 False:
+         - 只在 dd 超阈值时强制清仓，但不重置 peak
+         - 等组合净值恢复到阈值之上才允许重新交易（对“清仓后无法恢复”的场景不适用）
     """
-    def __init__(self, max_drawdown: float = 0.20) -> None:
+
+    def __init__(
+        self,
+        max_drawdown: float = 0.20,
+        *,
+        halt_trading_on_trigger: bool = False,
+        reset_peak_on_trigger: bool = True,
+    ) -> None:
         self.max_drawdown = float(max_drawdown)
+        self.halt_trading_on_trigger = bool(halt_trading_on_trigger)
+        self.reset_peak_on_trigger = bool(reset_peak_on_trigger)
+        self.last_actions: List[Dict] = []
 
     def manage_risk(self, portfolio: Portfolio, targets: List[PortfolioTarget]) -> List[PortfolioTarget]:
         prices = portfolio.last_prices
+        # reset side-channel actions each bar
+        self.last_actions = []
         if not prices:
             return targets
 
@@ -143,10 +215,33 @@ class PortfolioMaxDrawdownRiskModel(BaseRiskManagementModel):
             return targets
 
         dd = equity / peak - 1.0
+
         if dd <= -self.max_drawdown:
-            # 强制清仓：把当前持仓全部 target=0
-            forced = {sym: 0.0 for sym in portfolio.positions.keys()}
-            # 同时也把外部 targets 清掉（避免立刻又买回）
-            return [PortfolioTarget(symbol=s, target_percent=0.0) for s in forced.keys()]
+            # side-channel: for dashboard timeline
+            self.last_actions.append({
+                "symbol": "",
+                "action": "FORCE_FLAT_ALL",
+                "reason": "PORTFOLIO_MAX_DRAWDOWN",
+                "dd": float(dd),
+                "max_drawdown": float(self.max_drawdown),
+                "equity": float(equity),
+                "peak": float(peak),
+                "halt_trading_on_trigger": bool(self.halt_trading_on_trigger),
+                "reset_peak_on_trigger": bool(self.reset_peak_on_trigger),
+            })
+            # 1) 强制全清仓（包括外部 targets 和当前持仓）
+            all_syms = set(portfolio.positions.keys()) | {t.symbol for t in targets}
+            forced = [PortfolioTarget(symbol=s, target_percent=0.0) for s in sorted(all_syms)]
+
+            # 2) 可选：触发后停机（之后永远不执行，除非你手动把 portfolio.halt_trading=False）
+            if self.halt_trading_on_trigger:
+                setattr(portfolio, "halt_trading", True)
+
+            # 3) 可选：重置 peak，使得清仓后还能重新开仓
+            if self.reset_peak_on_trigger:
+                portfolio.equity_peak = float(equity)
+
+            return forced
 
         return targets
+
